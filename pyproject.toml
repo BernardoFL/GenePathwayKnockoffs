@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amortized-mcmc"
+version = "0.1.0"
+description = "Exact MH proposals for spatial latent-factor knockoff models"
+requires-python = ">=3.10"
+dependencies = [
+  "jax>=0.4.30",
+  "blackjax>=1.2",
+  "equinox>=0.11.6",
+  "numpy>=1.24",
+  "numpyro>=0.15",
+  "jraph>=0.0.6.dev0",
+  "optax>=0.2.3",
+  "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
