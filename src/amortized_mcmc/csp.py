@@ -24,6 +24,11 @@ class CSPState(NamedTuple):
         """Return the configured CSP truncation width."""
         return int(self.phi.shape[0])
 
+    @property
+    def nu(self) -> jax.Array:
+        """Return Horseshoe local scales under the model's canonical name."""
+        return self.lam
+
 
 def _stick_weights(v: jax.Array) -> jax.Array:
     """Convert finite stick-breaking fractions into category weights."""
@@ -44,7 +49,7 @@ def sample_csp_prior(
     """Draw CSP sticks, ordered allocations, precisions, and local scales."""
     if H < 1:
         raise ValueError("H must be positive")
-    v_key, z_key, phi_key, lam_key = jax.random.split(key, 4)
+    v_key, z_key, phi_key, lam_key, lam_aux_key = jax.random.split(key, 5)
     v = jnp.concatenate(
         (jax.random.beta(v_key, 1.0, concentration, (H - 1,)), jnp.ones((1,))),
     )
@@ -61,7 +66,15 @@ def sample_csp_prior(
     active = z == jnp.arange(H)
     phi_draws = jax.random.gamma(phi_key, a_phi, (H,)) / b_phi
     phi = jnp.where(active, phi_draws, theta_infty)
-    lam = 1.0 / jax.random.gamma(lam_key, 0.5, (n_genes, H))
+    # Half-Cauchy(0,1) via the Wand et al. (2011) two-stage InverseGamma
+    # parameter expansion: a ~ InvGamma(1/2,1), nu^2 | a ~ InvGamma(1/2, 1/a)
+    # marginalizes to nu ~ Half-Cauchy(0,1). Drawing nu directly as
+    # 1/Gamma(1/2,1) (i.e. nu ~ InvGamma(1/2,1)) is a materially different,
+    # far heavier-right-tailed distribution -- its median alone is ~4x too
+    # large -- so it must not be used as a Half-Cauchy substitute.
+    lam_auxiliary = 1.0 / jax.random.gamma(lam_key, 0.5, (n_genes, H))
+    lam_sq = (1.0 / lam_auxiliary) / jax.random.gamma(lam_aux_key, 0.5, (n_genes, H))
+    lam = jnp.sqrt(lam_sq)
     return CSPState(v, z, phi, jnp.asarray(concentration), jnp.asarray(b_phi), lam, a_phi, theta_infty)
 
 
@@ -91,8 +104,18 @@ def _sample_z(key, F, csp: CSPState) -> jax.Array:
 
 
 def _log_concentration(value, v, e0, f0):
-    """Evaluate the unnormalized finite-stick concentration conditional."""
-    return (e0 + v.shape[0] - 1.0) * jnp.log(value) - value * (f0 - jnp.sum(jnp.log1p(-v[:-1])))
+    """Evaluate the unnormalized finite-stick concentration conditional.
+
+    ``v`` is the *full* length-``H`` array returned by ``_sample_v``/the
+    prior, i.e. the ``H - 1`` free sticks plus the fixed ``v_H = 1``. Only
+    the ``H - 1`` free sticks are informative Beta(1, alpha_CSP) draws about
+    alpha_CSP (``v_H`` is deterministic), so the exponent uses
+    ``v.shape[0] - 1`` free draws, not the full array length -- using
+    ``v.shape[0]`` here would silently overweight the exponent by one and
+    bias alpha_CSP upward.
+    """
+    n_free = v.shape[0] - 1
+    return (e0 + n_free - 1.0) * jnp.log(value) - value * (f0 - jnp.sum(jnp.log1p(-v[:-1])))
 
 
 def _slice_concentration(key, current, v, e0, f0, width=1.0, steps=16):

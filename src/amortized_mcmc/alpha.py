@@ -93,3 +93,25 @@ def gibbs_step_alpha(
             _slice_one(index_key, alpha[index], index, state._replace(alpha=alpha), sigma_alpha, width, max_steps)
         )
     return alpha
+
+
+# The model has three distinct "alpha"s -- the patient effect alpha_p, the
+# CSP concentration alpha_CSP, and the MH acceptance probability alpha_MH.
+# This alias spells the patient-effect update by its full model name so call
+# sites never have to guess which "alpha" a bare `gibbs_step_alpha` means.
+gibbs_step_alpha_p = gibbs_step_alpha
+
+
+def gibbs_step_sigma_alpha_sq(key: jax.Array, alpha: jax.Array, a0: float = 2.0, b0: float = 1.0) -> jax.Array:
+    """Draw ``sigma_alpha^2`` from its InverseGamma conjugate conditional.
+
+    ``alpha_p ~ N(0, sigma_alpha^2)`` with prior ``sigma_alpha^2 ~
+    InverseGamma(a0, b0)`` is the one part of the patient-effect block that
+    *is* conjugate (unlike ``alpha_p`` itself, whose Poisson-log-Gaussian
+    conditional needs the slice sampler above): the posterior is
+    ``InverseGamma(a0 + P/2, b0 + 0.5 * sum(alpha_p^2))`` for ``P`` patients.
+    """
+    n_patients = alpha.shape[0]
+    shape = a0 + 0.5 * n_patients
+    rate = b0 + 0.5 * jnp.sum(alpha * alpha)
+    return rate / jax.random.gamma(key, shape)

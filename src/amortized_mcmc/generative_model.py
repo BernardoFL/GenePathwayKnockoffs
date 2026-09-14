@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
@@ -27,6 +28,11 @@ def full_generative_model(
     f0: float = 1.0,
     c0: float = 2.0,
     d0: float = 1.0,
+    a0: float = 2.0,
+    b0: float = 1.0,
+    pathway_laplacian: jnp.ndarray | None = None,
+    a_rho: float = 1.0,
+    b_rho: float = 1.0,
     X: jnp.ndarray | None = None,
 ):
     """Sample the complete §1/§7 hierarchy and Poisson observation model.
@@ -38,6 +44,24 @@ def full_generative_model(
     ``DiscreteHMCGibbs`` can enumerate and update each allocation while NUTS
     handles the continuous variables. Passing ``X`` conditions the model on
     observed counts for posterior reference-chain runs.
+
+    When ``pathway_laplacian`` is supplied, active columns of ``F`` are drawn
+    jointly per column from the proper Gaussian formed by *composing* the
+    per-entry Horseshoe precision with the pathway coupling precision --
+    ``F_{.,h} ~ N(0, (diag(phi_h / nu_{.,h}^2) + rho * pathway_laplacian)^{-1})``
+    for active ``h``, and the ordinary per-entry Horseshoe conditional for
+    inactive (spike) columns. This is the unique proper distribution
+    proportional to the "per-entry Horseshoe times pathway-coupling kernel"
+    product described in the model spec, so `Predictive` draws of `F`
+    actually reflect the pathway prior instead of silently ignoring it (the
+    diagonal Horseshoe term keeps the combined precision full rank even
+    though the pathway Laplacian alone is rank deficient, so no
+    pseudo-determinant convention is needed here -- that convention is used
+    downstream only by ``rho``'s own Gibbs full conditional, which is
+    independent of how ``F`` is *sampled* here since a constant that does
+    not depend on ``F`` cancels in every Metropolis-Hastings ratio that
+    holds ``phi``/``rho`` fixed). Omitting ``pathway_laplacian`` recovers the
+    plain elementwise Horseshoe/CSP prior.
     """
     alpha_csp = numpyro.sample("alpha_csp", dist.Gamma(e0, f0))
     b_phi = numpyro.sample("b_phi", dist.Gamma(c0, d0))
@@ -68,19 +92,33 @@ def full_generative_model(
         "lambda_local",
         dist.HalfCauchy(1.0).expand((n_genes, H)).to_event(2),
     )
-    F = numpyro.sample(
-        "F",
-        dist.Normal(0.0, lambda_local * jnp.sqrt(1.0 / phi)[None, :]).to_event(2),
-    )
+    if pathway_laplacian is None:
+        F = numpyro.sample(
+            "F",
+            dist.Normal(0.0, lambda_local * jnp.sqrt(1.0 / phi)[None, :]).to_event(2),
+        )
+    else:
+        rho = numpyro.sample("rho", dist.Gamma(a_rho, b_rho))
+        diag_precision = phi[None, :] / (lambda_local * lambda_local)  # (n_genes, H)
+        diagonal_terms = jax.vmap(jnp.diag, in_axes=1)(diag_precision)  # (H, n_genes, n_genes)
+        pathway_terms = jnp.where(
+            active[:, None, None], rho * pathway_laplacian[None, :, :], 0.0
+        )
+        precision = diagonal_terms + pathway_terms
+        F_by_column = numpyro.sample(
+            "F_by_column",
+            dist.MultivariateNormal(loc=jnp.zeros((H, n_genes)), precision_matrix=precision),
+        )
+        F = numpyro.deterministic("F", F_by_column.T)
     L = numpyro.sample("L", dist.Normal(0.0, 1.0).expand((n_spots, H)).to_event(2))
+    # Per-component L1 potential (see amortized_mcmc.target.laplace_mrf_logprob
+    # for why this must not be an edge-wise L2 group norm over components).
     differences = L[senders] - L[receivers]
-    numpyro.factor(
-        "laplace_mrf",
-        -jnp.sum(jnp.sqrt(jnp.sum(differences * differences, axis=-1) + 1e-8)) / mrf_scale,
-    )
+    numpyro.factor("laplace_mrf", -jnp.sum(jnp.abs(differences)) / mrf_scale)
+    sigma_alpha_sq = numpyro.sample("sigma_alpha_sq", dist.InverseGamma(a0, b0))
     alpha_p = numpyro.sample(
         "alpha_p",
-        dist.Normal(0.0, 1.0).expand((n_patient_effects,)).to_event(1),
+        dist.Normal(0.0, jnp.sqrt(sigma_alpha_sq)).expand((n_patient_effects,)).to_event(1),
     )
     p_of_s = jnp.zeros((n_spots,), dtype=jnp.int32)
     eta = L @ F.T + alpha_p[p_of_s, None]

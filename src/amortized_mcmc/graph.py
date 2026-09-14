@@ -90,3 +90,43 @@ def build_graph(coordinates: np.ndarray, method: str = "knn", k: int = 6) -> Gra
     else:
         raise ValueError("method must be 'knn' or 'delaunay'")
     return _directed_edges(edges, coordinates)
+
+
+def build_pathway_graph(affinity: np.ndarray, threshold: float = 0.0) -> Graph:
+    """Build a directed edge-list ``Graph`` from a weighted gene affinity matrix.
+
+    Edge weights (rather than Euclidean distances) are stored in the
+    ``distances`` field. This graph is the pathway-annotation graph
+    ``A_path`` that conditions Head 2's coupling flow and the pathway prior;
+    see :func:`assert_graphs_not_aliased` for why it must stay a distinct
+    object from any data-driven co-expression graph used by the knockoff
+    filter.
+    """
+    affinity = np.asarray(affinity, dtype=np.float32)
+    if affinity.ndim != 2 or affinity.shape[0] != affinity.shape[1]:
+        raise ValueError("affinity must be a square (n_genes, n_genes) matrix")
+    senders, receivers = np.nonzero(np.abs(affinity) > threshold)
+    keep = senders != receivers
+    senders, receivers = senders[keep], receivers[keep]
+    weights = affinity[senders, receivers]
+    return Graph(jnp.asarray(senders, dtype=jnp.int32), jnp.asarray(receivers, dtype=jnp.int32), jnp.asarray(weights))
+
+
+def assert_graphs_not_aliased(pathway_graph: Graph, knockoff_graph: Graph) -> None:
+    """Assert the pathway-annotation graph and knockoff test graph are distinct.
+
+    The pathway prior smooths ``F`` through the *annotation* graph
+    ``A_path``; the knockoff filter tests edge-level statistics defined by a
+    separate, *data-driven* co-expression graph ``A_jk``. If the same graph
+    object or edge set backed both, the prior would place mass on exactly
+    the structure the filter is meant to discover, biasing discovery toward
+    annotated pathways and undercutting the finite-sample FDR guarantee.
+    Call this wherever both graphs are assembled for a run.
+    """
+    if pathway_graph is knockoff_graph:
+        raise ValueError("pathway graph and knockoff test graph must not be the same object")
+    same_shape = pathway_graph.senders.shape == knockoff_graph.senders.shape
+    if same_shape and bool(jnp.all(pathway_graph.senders == knockoff_graph.senders)) and bool(
+        jnp.all(pathway_graph.receivers == knockoff_graph.receivers)
+    ):
+        raise ValueError("pathway graph and knockoff test graph must not share the same edge set")
